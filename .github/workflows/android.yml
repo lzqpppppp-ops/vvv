@@ -1,1 +1,266 @@
+name: Build Download Manager APK
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - '.github/workflows/android.yml'
 
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.9'
+      - name: Generate Android project
+        shell: bash
+        run: |
+          mkdir -p app/src/main/java/com/example/downloadkeeper
+          cat > settings.gradle <<'EOF'
+          pluginManagement { repositories { google(); mavenCentral(); gradlePluginPortal() } }
+          dependencyResolutionManagement { repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS); repositories { google(); mavenCentral() } }
+          rootProject.name = 'DownloadKeeper'
+          include ':app'
+          EOF
+          cat > build.gradle <<'EOF'
+          plugins { id 'com.android.application' version '8.7.3' apply false }
+          EOF
+          cat > app/build.gradle <<'EOF'
+          plugins { id 'com.android.application' }
+          android {
+              namespace 'com.example.downloadkeeper'
+              compileSdk 35
+              defaultConfig {
+                  applicationId 'com.example.downloadkeeper'
+                  minSdk 30
+                  targetSdk 35
+                  versionCode 1
+                  versionName '1.0'
+              }
+              compileOptions { sourceCompatibility JavaVersion.VERSION_17; targetCompatibility JavaVersion.VERSION_17 }
+          }
+          EOF
+          cat > app/src/main/AndroidManifest.xml <<'EOF'
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+              <uses-permission android:name="android.permission.MANAGE_EXTERNAL_STORAGE" />
+              <application android:label="下载管家" android:theme="@android:style/Theme.Material.Light.NoActionBar" android:usesCleartextTraffic="false">
+                  <activity android:name=".MainActivity" android:exported="true">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                      <intent-filter>
+                          <action android:name="android.intent.action.SEND" />
+                          <category android:name="android.intent.category.DEFAULT" />
+                          <data android:mimeType="*/*" />
+                      </intent-filter>
+                      <intent-filter>
+                          <action android:name="android.intent.action.SEND_MULTIPLE" />
+                          <category android:name="android.intent.category.DEFAULT" />
+                          <data android:mimeType="*/*" />
+                      </intent-filter>
+                  </activity>
+              </application>
+          </manifest>
+          EOF
+          cat > app/src/main/java/com/example/downloadkeeper/MainActivity.java <<'EOF'
+          package com.example.downloadkeeper;
+
+          import android.app.*;
+          import android.os.*;
+          import android.content.*;
+          import android.net.Uri;
+          import android.provider.Settings;
+          import android.view.*;
+          import android.widget.*;
+          import android.graphics.Color;
+          import java.io.*;
+          import java.security.MessageDigest;
+          import java.util.*;
+
+          public class MainActivity extends Activity {
+              private final File downloads = Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS);
+              private final LinkedHashSet<File> selected = new LinkedHashSet<>();
+              private final ArrayList<File> shown = new ArrayList<>();
+              private LinearLayout root, rows;
+              private TextView status;
+              private boolean duplicatesOnly = false;
+              private Intent pendingShare;
+
+              @Override public void onCreate(Bundle state) {
+                  super.onCreate(state);
+                  renderShell();
+                  if (Environment.isExternalStorageManager()) receive(getIntent());
+                  else { pendingShare = getIntent(); askPermission(); }
+              }
+              @Override public void onNewIntent(Intent intent) {
+                  super.onNewIntent(intent);
+                  setIntent(intent);
+                  if (Environment.isExternalStorageManager()) receive(intent);
+                  else { pendingShare = intent; askPermission(); }
+              }
+              @Override public void onResume() {
+                  super.onResume();
+                  if (Environment.isExternalStorageManager() && pendingShare != null) {
+                      Intent i = pendingShare; pendingShare = null; receive(i);
+                  } else refresh();
+              }
+              private void askPermission() {
+                  new AlertDialog.Builder(this).setTitle("访问下载文件")
+                    .setMessage("管理 Download 文件夹中的文件需要授予“所有文件访问权限”。授权后仅扫描 Download，删除前会确认。")
+                    .setPositiveButton("去授权", (d,w) -> {
+                        try { startActivity(new Intent(Settings.ACTION_MANAGE_APP_ALL_FILES_ACCESS_PERMISSION,
+                            Uri.parse("package:" + getPackageName()))); }
+                        catch (Exception e) { startActivity(new Intent(Settings.ACTION_MANAGE_ALL_FILES_ACCESS_PERMISSION)); }
+                    }).setNegativeButton("稍后", (d,w) -> refresh()).show();
+              }
+              private TextView text(String value, int size) {
+                  TextView t = new TextView(this); t.setText(value); t.setTextSize(size);
+                  t.setTextColor(Color.rgb(35, 41, 51)); t.setPadding(18, 16, 18, 16); return t;
+              }
+              private Button button(String name, Runnable action) {
+                  Button b = new Button(this); b.setText(name); b.setAllCaps(false);
+                  b.setOnClickListener(v -> action.run()); return b;
+              }
+              private void renderShell() {
+                  root = new LinearLayout(this); root.setOrientation(LinearLayout.VERTICAL);
+                  root.setBackgroundColor(Color.WHITE); setContentView(root);
+                  root.addView(text("下载管家", 24));
+                  HorizontalScrollView barScroll = new HorizontalScrollView(this);
+                  LinearLayout bar = new LinearLayout(this); bar.setOrientation(LinearLayout.HORIZONTAL);
+                  bar.addView(button("全部", () -> { duplicatesOnly=false; selected.clear(); refresh(); }));
+                  bar.addView(button("重复文件", () -> { duplicatesOnly=true; selected.clear(); refresh(); }));
+                  bar.addView(button("全选", () -> { selected.addAll(shown); refresh(); }));
+                  bar.addView(button("删除所选", this::confirmDelete));
+                  bar.addView(button("刷新", this::refresh));
+                  barScroll.addView(bar); root.addView(barScroll);
+                  status = text("", 14); root.addView(status);
+                  ScrollView scroller = new ScrollView(this);
+                  rows = new LinearLayout(this); rows.setOrientation(LinearLayout.VERTICAL);
+                  scroller.addView(rows); root.addView(scroller, new LinearLayout.LayoutParams(-1,0,1));
+              }
+              private void refresh() {
+                  if (rows == null) return;
+                  rows.removeAllViews(); shown.clear();
+                  if (!Environment.isExternalStorageManager()) {
+                      status.setText("尚未授权访问下载文件");
+                      rows.addView(button("授予权限", this::askPermission)); return;
+                  }
+                  File[] files = downloads.listFiles();
+                  if (files == null) { status.setText("无法读取 Download 文件夹"); return; }
+                  Arrays.sort(files, (a,b) -> Long.compare(b.lastModified(), a.lastModified()));
+                  if (duplicatesOnly) {
+                      status.setText("正在计算重复文件…");
+                      new Thread(() -> {
+                          Map<String,ArrayList<File>> groups = new HashMap<>();
+                          Map<Long,ArrayList<File>> bySize = new HashMap<>();
+                          for (File f: files) if (f.isFile()) bySize.computeIfAbsent(f.length(), k->new ArrayList<>()).add(f);
+                          for (ArrayList<File> sameSize: bySize.values()) if (sameSize.size()>1)
+                              for (File f: sameSize) {
+                                  String hash = sha256(f);
+                                  if (hash != null) groups.computeIfAbsent(f.length()+":"+hash,k->new ArrayList<>()).add(f);
+                              }
+                          ArrayList<File> matches = new ArrayList<>();
+                          for (ArrayList<File> g: groups.values()) if (g.size()>1) matches.addAll(g);
+                          matches.sort((a,b)->a.getName().compareToIgnoreCase(b.getName()));
+                          runOnUiThread(()->show(matches));
+                      }).start();
+                  } else show(Arrays.asList(files));
+              }
+              private String sha256(File f) {
+                  try (InputStream in=new BufferedInputStream(new FileInputStream(f))) {
+                      MessageDigest md=MessageDigest.getInstance("SHA-256"); byte[] buf=new byte[65536]; int n;
+                      while ((n=in.read(buf))!=-1) md.update(buf,0,n);
+                      StringBuilder out=new StringBuilder();
+                      for (byte b:md.digest()) out.append(String.format(java.util.Locale.ROOT,"%02x",b&255));
+                      return out.toString();
+                  } catch(Exception e) { return null; }
+              }
+              private void show(List<File> files) {
+                  if (rows==null) return;
+                  rows.removeAllViews(); shown.clear(); shown.addAll(files);
+                  status.setText((duplicatesOnly ? "重复文件（相同大小和内容）" : "Download 文件夹") + " · " + shown.size() + " 项 · 已选 " + selected.size());
+                  for (File f:shown) {
+                      TextView row=text((selected.contains(f)?"☑  ":"□  ")+(f.isDirectory()?"📁 ":"📄 ")+f.getName()
+                        + (f.isFile()?"\n"+human(f.length()):""),16);
+                      row.setBackgroundColor(selected.contains(f)?0xffd9edff:Color.WHITE);
+                      row.setOnLongClickListener(v->{toggle(f);return true;});
+                      row.setOnClickListener(v->{ if (!selected.isEmpty()) toggle(f);
+                        else if (f.isDirectory()) Toast.makeText(this,"首版只列出 Download 顶层文件",Toast.LENGTH_SHORT).show();
+                        else open(f); });
+                      rows.addView(row);
+                  }
+                  if (shown.isEmpty()) rows.addView(text(duplicatesOnly?"没有找到重复文件":"这里还没有文件",16));
+              }
+              private String human(long n) { return n>=1048576?String.format(java.util.Locale.ROOT,"%.1f MB",n/1048576.0):n>=1024?String.format(java.util.Locale.ROOT,"%.1f KB",n/1024.0):n+" B"; }
+              private void toggle(File f) { if (!selected.add(f)) selected.remove(f); show(new ArrayList<>(shown)); }
+              private void open(File f) {
+                  try {
+                      Uri uri=android.net.Uri.parse("content://com.android.externalstorage.documents/document/primary%3ADownload%2F"+Uri.encode(f.getName()));
+                      Intent i=new Intent(Intent.ACTION_VIEW).setDataAndType(uri, getContentResolver().getType(uri));
+                      i.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION); startActivity(i);
+                  } catch (Exception e) { Toast.makeText(this,"无法打开此文件",Toast.LENGTH_SHORT).show(); }
+              }
+              private void confirmDelete() {
+                  if(selected.isEmpty()) { Toast.makeText(this,"先长按选择文件",Toast.LENGTH_SHORT).show(); return; }
+                  ArrayList<File> targets=new ArrayList<>(selected);
+                  new AlertDialog.Builder(this).setTitle("删除 " + targets.size() + " 项？")
+                    .setMessage("删除后可能无法恢复；文件夹内的内容也会一并删除。")
+                    .setNegativeButton("取消",null).setPositiveButton("删除",(d,w)->{
+                        int ok=0; for(File f:targets) if(deleteTree(f)) ok++;
+                        selected.clear(); duplicatesOnly=false; refresh();
+                        Toast.makeText(this,"已删除 "+ok+" / "+targets.size()+" 项",Toast.LENGTH_LONG).show();
+                    }).show();
+              }
+              private boolean deleteTree(File f) {
+                  if(f.isDirectory()) { File[] children=f.listFiles(); if(children==null) return false;
+                    for(File child:children) if(!deleteTree(child)) return false; }
+                  return f.delete();
+              }
+              private void receive(Intent i) {
+                  if(i==null || !Environment.isExternalStorageManager()) return;
+                  ArrayList<Uri> uris=new ArrayList<>();
+                  if(Intent.ACTION_SEND.equals(i.getAction())) {
+                      Uri u=i.getParcelableExtra(Intent.EXTRA_STREAM,Uri.class); if(u!=null) uris.add(u);
+                  } else if(Intent.ACTION_SEND_MULTIPLE.equals(i.getAction())) {
+                      ArrayList<Uri> list=i.getParcelableArrayListExtra(Intent.EXTRA_STREAM,Uri.class);
+                      if(list!=null) uris.addAll(list);
+                  }
+                  if(uris.isEmpty()) return;
+                  int count=0; downloads.mkdirs();
+                  for(Uri u:uris) {
+                      try {
+                          String filename="shared-file";
+                          try(android.database.Cursor c=getContentResolver().query(u,new String[]{android.provider.OpenableColumns.DISPLAY_NAME},null,null,null)) {
+                              if(c!=null && c.moveToFirst()) filename=c.getString(0);
+                          } catch(Exception ignored) {}
+                          if(filename==null || filename.isBlank()) filename="shared-file";
+                          filename=filename.replaceAll("[/\\\\]","_");
+                          File target=new File(downloads,filename); int suffix=1;
+                          while(target.exists()) target=new File(downloads,suffix++ + "-" + filename);
+                          try(InputStream in=getContentResolver().openInputStream(u); OutputStream out=new FileOutputStream(target)) {
+                              if(in==null) throw new IOException("无法打开分享文件");
+                              byte[] b=new byte[65536]; int n; while((n=in.read(b))!=-1) out.write(b,0,n);
+                          }
+                          count++;
+                      } catch(Exception e) { android.util.Log.e("DownloadKeeper","Import failed",e); }
+                  }
+                  Toast.makeText(this,"已保存到 Download："+count+" / "+uris.size()+" 个",Toast.LENGTH_LONG).show();
+                  duplicatesOnly=false; refresh();
+              }
+          }
+          EOF
+      - name: Build APK
+        run: gradle --no-daemon :app:assembleDebug
+      - uses: actions/upload-artifact@v4
+        with:
+          name: DownloadKeeper-debug-apk
+          path: app/build/outputs/apk/debug/app-debug.apk
+          if-no-files-found: error
